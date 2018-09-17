@@ -29,40 +29,90 @@
 package org.opennms.core.ipc.sink.offheap;
 
 import static org.junit.Assert.assertEquals;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+
+import java.io.IOException;
+import java.util.AbstractMap;
+import java.util.concurrent.Executors;
 
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.opennms.core.ipc.sink.api.WriteFailedException;
+import org.osgi.service.cm.ConfigurationAdmin;
 
 public class H2DataStoreTest {
 
-    private H2DataStore queue;
+    private H2OffHeapStore queue;
 
     private boolean perf = false;
 
     @Before
-    public void setup() {
-        System.setProperty("org.opennms.minion.sink.queue.filename", "/home/chandra/dev/test/cq/h2/h2-data.data");
-        queue = new H2DataStore();
-        queue.init(3000000000L);
+    public void setup() throws IOException {
+        // System.setProperty("org.opennms.minion.sink.queue.filename",
+        // "/home/chandra/dev/test/cq/h2/h2-data.data");
+        ConfigurationAdmin configAdmin = mock(ConfigurationAdmin.class, RETURNS_DEEP_STUBS);
+        queue = new H2OffHeapStore(configAdmin);
+        queue.init();
     }
 
     @Test
-    public void testH2DataStore() throws InterruptedException {
+    public void testH2DataStore() throws InterruptedException, WriteFailedException {
 
         System.out.println("Size of store " + queue.getSize());
         long beforeWrite = System.currentTimeMillis();
-        for (int i = 0; i < 1000000; i++) {
-            String message = "This is " + i + "  message";
-            queue.writeMessage(message.getBytes());
+        Executors.newSingleThreadExecutor().execute(() -> {
+            for (int i = 0; i < 1000; i++) {
+                String message = "This is " + i + " trap message";
+                try {
+                    queue.writeMessage(message.getBytes(), "traps");
+                } catch (WriteFailedException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+            }
+        });
+        
+        Executors.newSingleThreadExecutor().execute(() -> {
+            for (int i = 0; i < 1000; i++) {
+                String message = "This is " + i + " syslog message";
+                try {
+                    queue.writeMessage(message.getBytes(), "syslog");
+                } catch (WriteFailedException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+            }
+        });
+        for (int i = 0; i < 1000; i++) {
+            String message = "This is " + i + " event message";
+            queue.writeMessage(message.getBytes(), "events");
         }
+        
         System.out.println("Size of store " + queue.getSize());
         long afterWrite = System.currentTimeMillis();
-        for (int i = 0; i < 1000000; i++) {
-            byte[] messageBytes = queue.readNextMessage();
+        for (int i = 0; i < 1000; i++) {
+            AbstractMap.SimpleImmutableEntry<String, byte[]> keyValue = queue.readNextMessage("traps");
             if (!perf) {
-                String message = new String(messageBytes);
-                String matcher = "This is " + i + "  message";
+                String message = new String(keyValue.getValue());
+                String matcher = "This is " + i + " trap message";
+                assertEquals(matcher, message);
+            }
+        }
+        for (int i = 0; i < 1000; i++) {
+            AbstractMap.SimpleImmutableEntry<String, byte[]> keyValue = queue.readNextMessage("syslog");
+            if (!perf) {
+                String message = new String(keyValue.getValue());
+                String matcher = "This is " + i + " syslog message";
+                assertEquals(matcher, message);
+            }
+        }
+        for (int i = 0; i < 1000; i++) {
+            AbstractMap.SimpleImmutableEntry<String, byte[]> keyValue = queue.readNextMessage("events");
+            if (!perf) {
+                String message = new String(keyValue.getValue());
+                String matcher = "This is " + i + " event message";
                 assertEquals(matcher, message);
             }
         }
@@ -72,7 +122,7 @@ public class H2DataStoreTest {
         System.out.println("Total read time  " + (afterRead - afterWrite));
         System.out.println("Total time  " + (afterRead - beforeWrite));
         // }
-        Thread.sleep(3000);
+        Thread.sleep(5000);
         System.out.println("Size of store " + queue.getSize());
     }
 

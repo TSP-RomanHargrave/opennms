@@ -28,28 +28,13 @@
 
 package org.opennms.core.ipc.sink.api;
 
-public interface OffHeapFifoQueue {
-    
-    void init(long maxSizeInBytes);
+public class WriteFailedException extends Exception {
 
-    /**
-     * Thread safe. Should throw exception when full.
-     *
-     * @param message
-     */
-    void writeMessage(byte[] message);
+    private static final long serialVersionUID = -6945401599648861750L;
 
-    /**
-     * Thread safe.
-     *
-     * Retrieves and removes the head of this queue, waiting if necessary
-     * until an element becomes available.
-     *
-     * @return the head of this queue
-     * @throws InterruptedException if interrupted while waiting
-     */
-    byte[] readNextMessage() throws InterruptedException;
+    public WriteFailedException() {
+        super();
+    }
 
-    void destroy();
 
 }

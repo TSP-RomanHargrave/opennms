@@ -28,21 +28,31 @@
 
 package org.opennms.core.ipc.sink.common;
 
+import java.util.AbstractMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch; 
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.joda.time.Duration;
 import org.opennms.core.concurrent.LogPreservingThreadFactory;
 import org.opennms.core.ipc.sink.api.AsyncDispatcher;
 import org.opennms.core.ipc.sink.api.AsyncPolicy;
 import org.opennms.core.ipc.sink.api.Message;
+import org.opennms.core.ipc.sink.api.OffHeapQueue;
+import org.opennms.core.ipc.sink.api.SinkModule;
 import org.opennms.core.ipc.sink.api.SyncDispatcher;
+import org.opennms.core.ipc.sink.api.WriteFailedException;
+import org.opennms.core.ipc.sink.common.offheap.OffHeapServiceLoader;
 import org.opennms.core.utils.SystemInfoUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,12 +62,15 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.swrve.ratelimitedlogger.RateLimitedLog;
 
-public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implements AsyncDispatcher<S>  {
+public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implements AsyncDispatcher<S> {
 
     private static final Logger LOG = LoggerFactory.getLogger(AsyncDispatcherImpl.class);
-
     private final SyncDispatcher<S> syncDispatcher;
-
+    private OffHeapAdapter offHeapAdapter;
+    private ExecutorService offHeapAdapterExecutor = Executors.newSingleThreadExecutor();
+    private final AsyncPolicy asyncPolicy;
+    private static boolean useOffHeap = false;
+    
     final RateLimitedLog rateLimittedLogger = RateLimitedLog
             .withRateLimit(LOG)
             .maxRate(5).every(Duration.standardSeconds(30))
@@ -66,11 +79,22 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
     final LinkedBlockingQueue<Runnable> queue;
     final ExecutorService executor;
 
-    public AsyncDispatcherImpl(DispatcherState<W,S,T> state, AsyncPolicy asyncPolicy, SyncDispatcher<S> syncDispatcher) {
+    public AsyncDispatcherImpl(DispatcherState<W, S, T> state, AsyncPolicy asyncPolicy,
+            SyncDispatcher<S> syncDispatcher) {
         Objects.requireNonNull(state);
         Objects.requireNonNull(asyncPolicy);
         this.syncDispatcher = Objects.requireNonNull(syncDispatcher);
+        this.asyncPolicy = asyncPolicy;
 
+        if (OffHeapServiceLoader.isOffHeapEnabled()) {
+            OffHeapQueue offHeapQueue = OffHeapServiceLoader.getOffHeapQueue();
+            if (offHeapQueue != null) {
+                this.offHeapAdapter = new OffHeapAdapter(state.getModule(), offHeapQueue);
+                offHeapAdapterExecutor.execute(offHeapAdapter);
+                useOffHeap = true;
+            }
+        }
+        
         final RejectedExecutionHandler rejectedExecutionHandler;
         if (asyncPolicy.isBlockWhenFull()) {
             // This queue ensures that calling thread is blocked when the queue is full
@@ -129,6 +153,7 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
      *
      * If the implementation is changed, make sure that that executor is built accordingly.
      */
+    
     private static class OfferBlockingQueue<E> extends LinkedBlockingQueue<E> {
         private static final long serialVersionUID = 1L;
 
@@ -141,7 +166,7 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
             try {
                 put(e);
                 return true;
-            } catch(InterruptedException ie) {
+            } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
             }
             return false;
@@ -150,6 +175,15 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
 
     @Override
     public CompletableFuture<S> send(S message) {
+        // Check if OffHeap enabled.
+        // If enabled, is queue full or is OffHeap not Empty then write message to OffHeap.
+        if (useOffHeap && (asyncPolicy.getQueueSize() == getQueueSize() || !offHeapAdapter.isEmpty())) {
+            try {
+                return offHeapAdapter.writeMessage(message);
+            } catch (WriteFailedException e) {
+                LOG.error("OffHeap write failed ", e);
+            }
+        }
         try {
             return CompletableFuture.supplyAsync(() -> {
                 syncDispatcher.send(message);
@@ -161,7 +195,7 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
             return future;
         }
     }
-
+    
     @Override
     public int getQueueSize() {
         return queue.size();
@@ -171,5 +205,72 @@ public class AsyncDispatcherImpl<W, S extends Message, T extends Message> implem
     public void close() throws Exception {
         syncDispatcher.close();
         executor.shutdown();
+        if (offHeapAdapter != null) {
+            offHeapAdapter.shutdown();
+            offHeapAdapterExecutor.shutdown();
+        }
     }
+
+    private class OffHeapAdapter implements Runnable {
+
+        private SinkModule<S, T> sinkModule;
+        private OffHeapQueue offHeapQueue;
+        private Map<String, CompletableFuture<S>> offHeapFutureMap = new ConcurrentHashMap<>();
+        private final CountDownLatch firstWrite = new CountDownLatch(1);
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        public OffHeapAdapter(SinkModule<S, T> module, OffHeapQueue offHeapQueue) {
+            this.sinkModule = module;
+            this.offHeapQueue = offHeapQueue;
+        }
+
+        @Override
+        public void run() {
+            while (!closed.get()) {
+               
+                try {
+                    // Wait till atleast one write call to offHeap
+                    firstWrite.await();
+                    //retrieve key i.e. uuid and value byte array.
+                    AbstractMap.SimpleImmutableEntry<String, byte[]> keyValue = offHeapQueue
+                            .readNextMessage(sinkModule.getId());
+                    if (keyValue != null) {
+                        queue.put(() -> {
+                            S message = (S) sinkModule.unmarshal(keyValue.getValue());
+                            syncDispatcher.send(message);
+                            CompletableFuture<S> future = offHeapFutureMap.get(keyValue.getKey());
+                            offHeapFutureMap.remove(keyValue.getKey());
+                            future.complete(message);
+                        });
+
+                    }
+                } catch (InterruptedException e) {
+                    // TODO Auto-generated catch block
+                    e.printStackTrace();
+                }
+            }
+        }
+        
+        public CompletableFuture<S> writeMessage(S message) throws WriteFailedException {
+            final CompletableFuture<S> future = new CompletableFuture<>();
+            byte[] bytes = sinkModule.marshal((T) message);
+            String key = offHeapQueue.writeMessage(bytes, sinkModule.getId());
+            offHeapFutureMap.put(key, future);
+            firstWrite.countDown();
+            return future;
+            
+        }
+        
+        public boolean isEmpty() {
+            return offHeapFutureMap.isEmpty();
+        }
+        
+        public void shutdown() {
+            firstWrite.countDown();
+            closed.set(true);
+        }
+
+    }
+
+  
 }
